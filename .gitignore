@@ -1,0 +1,11 @@
+# 构建产物（名字与目录同名，锚定到仓库根，别把目录本身忽略掉）
+/dma_acs_test
+/dma_acs_test_v2
+*.o
+*.out
+
+# 运行时/调试残留
+debug.log
+*.rec
+core
+core.*
