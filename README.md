@@ -697,3 +697,9 @@ sudo ./dma_acs_test -d 02:00.0 --peek auto
 | `E_HW_STATUS(状态寄存器报错)` | 引擎报错；若 Status 含非错误位，用 `--ignore_status` |
 | `E_MISMATCH(数据校验不一致)` | 测试区回读与 pattern 不符；emu 上多为写数据尚未落到 BAR，见 9.4 |
 | `E_INIT_CHECK(初始化区回读校验失败)` | CPU 写完 init 区后回读重试 1000 次仍不符：CPU 的 MMIO 写迟迟没有落到 BAR，emu 时序问题，见 9.4 |
+
+## 10. 许可
+
+MIT License，见 [LICENSE](LICENSE)。
+
+本工具直接读写 PCIe 设备的 BAR，误用可能损坏设备或数据。请只在受控测试平台上、对确认过的 bdf/bar 使用，风险自负。
