@@ -242,9 +242,10 @@ make                  # 生成 dma_acs_test
 sudo ./dma_acs_test -s 0000:01:00.0 -d 0000:02:00.0 -l 1M -n 0 --dst_bar 4 --dbg_times 100
 
 ./pack.sh             # 改完代码打快照：../dma_acs_test_YYYYmmdd-HHMMSS.tar
+./pack.sh 3           # 同上，但保留最近 3 份（默认只留最新 1 份）
 ```
 
-`pack.sh` 只打源码/文档/构建脚本，`.git`、编译产物、`debug.log`、`*.rec` 都不进包；产物放在工程目录的上一级，文件名带日期时间到秒。
+`pack.sh` 只打源码/文档/构建脚本，`.git`、编译产物、`debug.log`、`*.rec` 都不进包；产物放在工程目录的上一级，文件名带日期时间到秒。打完会顺手清掉更早的包——默认只保留最新一份，避免快照堆积，想留几份就给个数字。
 
 参数：
 

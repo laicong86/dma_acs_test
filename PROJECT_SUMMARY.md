@@ -115,4 +115,4 @@ sudo ./dma_acs_test -d 02:00.0 --owner dma0 --peek auto    # 回读 bar 对照
 - 文档改动需同步三处：`usage()` 帮助文本、`README.md` 参数表/注意事项、本文件的状态段。
 - **每次改完代码必须打包快照**：`./pack.sh`，产物落在上一级目录，名字带日期时间到秒
   （`dma_acs_test_YYYYmmdd-HHMMSS.tar`）。只含源码/文档/构建脚本，排除 `.git`、编译产物、
-  `debug.log`、`*.rec`。
+  `debug.log`、`*.rec`。打完自动清理更早的包：默认只留最新 1 份，`./pack.sh 3` 可保留 3 份。
