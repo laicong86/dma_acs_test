@@ -240,7 +240,11 @@ sudo ./dma_acs_test -d 02:00.0 --owner dma0 --peek auto  # 重新读 bar 上出�
 ```bash
 make                  # 生成 dma_acs_test
 sudo ./dma_acs_test -s 0000:01:00.0 -d 0000:02:00.0 -l 1M -n 0 --dst_bar 4 --dbg_times 100
+
+./pack.sh             # 改完代码打快照：../dma_acs_test_YYYYmmdd-HHMMSS.tar
 ```
+
+`pack.sh` 只打源码/文档/构建脚本，`.git`、编译产物、`debug.log`、`*.rec` 都不进包；产物放在工程目录的上一级，文件名带日期时间到秒。
 
 参数：
 

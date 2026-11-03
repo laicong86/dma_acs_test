@@ -113,3 +113,6 @@ sudo ./dma_acs_test -d 02:00.0 --owner dma0 --peek auto    # 回读 bar 对照
 - 头的字段一律 4 字节对齐 + 32 位整字访问；新增字段时不许引入 8/16 位或跨字访问。
 - 语义相近的旧参数名不做兼容保留（例如 `--check_delay_us` 已彻底删除改为 `--check_delay_ms`），避免混用。
 - 文档改动需同步三处：`usage()` 帮助文本、`README.md` 参数表/注意事项、本文件的状态段。
+- **每次改完代码必须打包快照**：`./pack.sh`，产物落在上一级目录，名字带日期时间到秒
+  （`dma_acs_test_YYYYmmdd-HHMMSS.tar`）。只含源码/文档/构建脚本，排除 `.git`、编译产物、
+  `debug.log`、`*.rec`。
