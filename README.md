@@ -297,7 +297,21 @@ sudo ./dma_acs_test -s 0000:01:00.0 -d 0000:02:00.0 -l 1M -n 0 --dst_bar 4 --dbg
                         off 是 bar 内绝对偏移（含 --dst_off）；
                         auto 表示出错偏移从本地记录里取，并自动与期望/实际值对照
     --peek_len <n>      --peek 的回读长度（默认 64 字节）
-    --selftest          只跑 CPU 侧数据通路自检（不碰硬件），并打印 CPU 特性
+    --selftest          只跑 CPU 侧数据通路自检，并打印 CPU 特性。
+                        不带 -d 时是纯内存自检（完全不碰硬件）；
+                        带 -d 时改为 CPU 直接读写该设备的 bar，位置由
+                        --st_bar / --st_off / -l 指定，方向由 --st_op 指定。
+    --st_op <rw|rd|wr>  --selftest 打 bar 时的方向（默认 rw）：
+                        rw = 写 pattern -> 回读比对 -> 写反码确认确实可写
+                        rd = 只读：dump 内容后退出，一个字节都不写（映射也是只读的）
+                        wr = 只写：按 pattern 反复覆盖，不回读比对
+    --st_bar <n>        --selftest 用的 bar 号（默认跟随 --dst_bar）
+    --st_off <off>      --selftest 区间的 bar 内起始偏移（默认 0，须 8 字节对齐）
+    --no_init           闭环测试跳过"CPU 填 init 区 + 污染 test 区"这一步。
+                        init 区内容由外部预置（对端卡的 DMA 刚写进来 / 别的进程已铺好），
+                        本轮只做 DMA 读 -> DMA 写。没有预设 pattern 时，比对基准自动
+                        改成"起 DMA 之前 CPU 读到的 init 区实际内容"，仍能验证搬运无损。
+                        与 --stress 互斥（压力模式本来就不改写数据）。
 
 目的 bar 测试头 / 占用链：
 -c, --clear             启动时清空目的 bar（测试头 + 链上分配过的数据区，到链尾为止），然后正常测试
@@ -562,6 +576,34 @@ sudo ./dma_acs_test -d 02:00.0 --dst_bar 4 --list
 - 并发场景下 mismatch 是**预期结果**，不是 bug；用 `--no_stop_on_err` 可以持续跑并统计失败率。
 - CPU 模式同样会写错误标志、同样有触发点（见 4.1）；只有叠加 `--no_alloc` 时没有头、没有触发点。`--list` 里 `源 bdf` 会显示 `cpu`。
 
+### 7.1 `--no_init`：不填 init 区，只验证"搬运"
+
+默认闭环里 CPU 要先把 init 区填成已知 pattern，DMA 才有东西可读。当你**不需要 CPU 提供数据**时用 `--no_init` 跳过这一步：
+
+```bash
+# 双卡对打：B 的 DMA 已经把数据写进 A 的 init 区，
+# 现在只让 A 的 DMA 把它搬到 test 区，验证搬运链路是否无损
+sudo ./dma_acs_test -s <bdfA> -d <bdfA> --dst_bar 4 -l 1M -n 0 \
+     --owner a-move --no_init --check_delay_ms 5
+```
+
+跳过的是阶段 1 的这三件事：填 init pattern、把 test 区污染成反码、回读 init 确认落盘。
+
+此时没有预设 pattern 可比，比对基准换成**起 DMA 之前 CPU 读到的 init 区实际内容**（存在 `gold` 缓冲里，整片大小）。所以仍能判出：
+
+| 现象 | 说明 |
+|---|---|
+| PASS | DMA 读到的内容与 CPU 读到的完全一致，且 DMA 写回了 test 区 |
+| mismatch，test 偏移处 init 也有更新 | 搬运链路中间把数据改了 |
+| mismatch，但 test 里是**旧值** | 典型是 `--check_delay_ms` 不够，P2P 写还没落到 BAR |
+
+注意两点：
+
+- **`gold` 抓的是"CPU 视角"的内容**。CPU 能读到不代表 DMA 能读到——两条路径的可见性在 emu 上可能不同，所以 `--init_delay_ms` 在这里依然是有效的补偿手段（抓完基准后会再等一次）。
+- 与 `--stress` 互斥：压力模式本来就不改写数据，叠加没有意义，程序启动时直接拒绝。
+
+配合 `--selftest --st_op rd` 可以先确认"DMA 会读的那片 init 区里到底是什么"，两者用同一组 `--st_bar/--st_off/-l` 坐标对齐。
+
 ## 8. 注意事项
 
 1. **需要 root**（或对 `/sys/bus/pci/devices/<bdf>/resource<N>` 有读写权限）。BAR 通过 `O_SYNC` 方式 mmap，保证非 cache 语义、寄存器写不被重排。
@@ -610,6 +652,16 @@ grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -E '^avx|^sse4_2|^erms'
 
 ```bash
 ./dma_acs_test --selftest          # 只跑 CPU 侧数据通路，不碰硬件
+```
+
+如果怀疑问题具体落在某块 bar 的某一段上，让 `--selftest` 直接打那片地址（不经过 DMA）：
+
+```bash
+# 只读那一小段，先看里面到底是什么（映射为只读，硬件侧不可能被改动）
+sudo ./dma_acs_test -d 02:00.0 --selftest --st_bar 0 --st_off 0x1000 -l 4K --st_op rd
+
+# 验证那片空间真的可写：写 pattern -> 回读比对 -> 写反码 -> 再回读
+sudo ./dma_acs_test -d 02:00.0 --selftest --st_bar 0 --st_off 0x1000 -l 4K --st_op rw
 ```
 
 

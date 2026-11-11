@@ -207,7 +207,11 @@ struct cfg {
     int      peek_auto;     /* --peek auto：出错偏移从错误记录里取 */
     uint64_t peek_off;      /* --peek 指定的 bar 偏移 */
     uint64_t peek_len;      /* --peek_len 回读长度，默认 64 字节 */
-    int      selftest;      /* 只跑 CPU 侧数据通路自检后退出 */
+    int      selftest;      /* --selftest CPU 侧自检；带 -d 时改为直接读写 bar */
+    int      no_init;       /* --no_init 跳过 CPU 填/污染 init 区，拿 bar 实测值当基准 */
+    int      st_op;         /* --st_op 自检方向：0=读写 1=只读 2=只写 */
+    int      st_bar;        /* --st_bar 自检用的 bar 号，-1 = 跟随 --dst_bar */
+    uint64_t st_off;        /* --st_off 自检区间在 bar 内的起始偏移 */
     int      clear;         /* 启动时清空目的 bar（测试头 + 链表 + 数据区） */
     int      clear_only;    /* 只清空后退出 */
     int      list;          /* 只打印占用链后退出 */
@@ -245,6 +249,7 @@ struct ctx {
     volatile uint32_t *trip;
     uint64_t   block;     /* 单次 DMA 实际长度          */
     uint8_t   *pat;       /* pattern 缓冲（同时作为黄金比对源） */
+    uint8_t   *gold;      /* --no_init 用：init 区实测内容快照（整片 size 大小） */
     uint8_t   *bounce;    /* --cpu 模式的"中间内存"，模拟 ACS 内部内存 */
 
     /* 失败现场：抓在打点之后，供事后打印；打点之前一律不碰 */
@@ -732,6 +737,11 @@ static void copy_words(uint8_t *dst, const uint8_t *src, uint64_t len, int inver
 #define ADDR_SEQ   1
 #define ADDR_RAND  2
 
+/* --selftest 打到 bar 时的方向（纯内存自检时不使用） */
+#define SELFTEST_RW 0
+#define SELFTEST_RD 1
+#define SELFTEST_WR 2
+
 /* 顺序模式的步长：0 = 自动（大区按页滑、小区按 qword 滑） */
 static uint64_t stress_addr_step(const struct ctx *c)
 {
@@ -1151,6 +1161,154 @@ static void print_cpu_flags(void)
     }
 
     fclose(fp);
+}
+
+/*
+ * ============================== CPU 自检（可指定 bar/off/size） ==============================
+ *
+ * --selftest 原本只跑纯内存自检（pattern -> 内存 -> 比对），用来把"环境问题"
+ * 和"程序问题"分开。这里扩展成"也能直接打 bar"：
+ *
+ *   ./dma_acs_test --selftest                          # 老行为：纯内存
+ *   ./dma_acs_test -d 02:00.0 --selftest --st_bar 0 \
+ *                  --st_off 0x1000 -l 4K               # 打 dst bar0 的 0x1000~0x2000
+ *
+ * st_op 决定方向：
+ *   rw（默认） 写 pattern -> 回读比对 -> 再写反码 -> 回读确认确实变了
+ *   rd         只读：dump 内容、算累加和，不改动任何字节（安全的"看一眼"）
+ *   wr         只写：pattern / 反码交替写，不做回读比对
+ *
+ * 与 --no_init 的配合见 do_one_iter：--no_init 让闭环测试阶段 1 不碰 init 区，
+ * 数据由对端（另一张卡的 DMA 或别的进程）预先写好；本函数就是用来确认
+ * "我想让 DMA 读的那片 init 区，CPU 能看到什么"——读出来的内容也就是
+ * --no_init 下阶段 3 的比对基准来源。
+ */
+static int run_selftest_bar(struct ctx *c)
+{
+    struct bar *b = &c->dst;
+    uint64_t    off = c->cfg.st_off;
+    uint64_t    n = c->cfg.size;
+    uint64_t    bad_off = 0, got = 0, exp = 0;
+    uint64_t    i;
+    uint64_t    loops;
+    int         rc = E_OK;
+
+    if (n == 0)
+        n = 4096;
+
+    /* -n 0 在闭环测试里表示无限循环；自检没有退出判据，按 1 轮处理 */
+    loops = c->cfg.times ? c->cfg.times : 1;
+    if (loops > 1000000ull) {
+        fprintf(stderr, "--selftest 打 bar 的 -n 上限 1000000（当前 %" PRIu64 "）\n", loops);
+        return -E_USAGE;
+    }
+
+    if (off & 0x7ull) {
+        fprintf(stderr, "--st_off 必须 8 字节对齐: 0x%" PRIx64 "\n", off);
+        return -E_USAGE;
+    }
+    /*
+     * --st_off 和 --dst_off 是两套坐标：前者只描述"这次自检读哪一段"，
+     * 后者描述"测试头/占用链从哪开始"。同时给了容易看混，明确提示一次。
+     */
+    if (off && c->cfg.dst_off && off != c->cfg.dst_off)
+        printf("提示: --st_off 0x%" PRIx64 " 只用于本次自检，与 --dst_off 0x%" PRIx64
+               "（测试头起点）无关\n", off, c->cfg.dst_off);
+    if (off >= b->size || n > b->size - off) {
+        fprintf(stderr,
+                "--st_off 0x%" PRIx64 " + -l %" PRIu64 " 越界：bar%d 只有 0x%" PRIx64 " 字节\n",
+                off, n, b->num, b->size);
+        return -E_LAYOUT;
+    }
+    /* 与 --dst_off 同一口径：bar 内偏移最终按 32 位传给 mmio 访问 */
+    if (off + n > 0xFFFFFFFFull) {
+        fprintf(stderr, "--st_off + -l 超出 32 位寻址范围（bar 内偏移按 32 位）\n");
+        return -E_LAYOUT;
+    }
+
+    c->pat = malloc((size_t)n);
+    if (!c->pat) {
+        fprintf(stderr, "分配 %" PRIu64 " 字节 pattern 缓冲失败\n", n);
+        return -E_NOMEM;
+    }
+
+    printf("================ CPU 直读直写 BAR 自检 ================\n");
+    print_cpu_flags();
+    printf("  目标        : %s bar%d  phys=0x%016" PRIx64 "\n",
+           b->bdf, b->num, b->phys);
+    printf("  区间        : bar+0x%" PRIx64 " ~ bar+0x%" PRIx64 "（%s）\n",
+           off, off + n, c->cfg.st_op == SELFTEST_RD ? "只读" :
+                          c->cfg.st_op == SELFTEST_WR ? "只写" : "写+回读");
+    printf("  长度/轮次   : %" PRIu64 " B × %" PRIu64 " 轮\n", n, loops);
+    printf("  数据模式    : %s\n",
+           c->cfg.pat_mode == PAT_INC ? "递增 inc" :
+           c->cfg.pat_mode == PAT_ALT ? "翻转 alt" : "随机 rand");
+    printf("------------------------------------------------------\n");
+
+    if (c->cfg.st_op == SELFTEST_RD) {
+        /* 只读：dump 头 64 字节 + 整片累加和（不改动 BAR 任何字节） */
+        uint64_t sum = 0;
+
+        hexdump_bar(b, off, n < 64 ? n : 64);
+        for (i = 0; i + 8 <= n; i += 8)
+            sum ^= mmio_rd64(b->va, (uint32_t)(off + i));
+
+        printf("  累加和(XOR) : 0x%016" PRIx64 "\n", sum);
+        printf("  READ PASS: 已读出 bar+0x%" PRIx64 " 起 %" PRIu64 " 字节，未写入任何字节\n",
+               off, n);
+        free(c->pat);
+        c->pat = NULL;
+        printf("======================================================\n");
+        return E_OK;
+    }
+
+    for (i = 0; i < (uint64_t)loops && !g_stop; i++) {
+        uint64_t seed = c->cfg.seed ^ (i * 0x9E3779B97F4A7C15ull);
+
+        /* 1) 写 pattern */
+        pattern_fill(c->pat, n, seed, c->cfg.pat_mode, i);
+        copy_words(b->va + off, c->pat, n, 0);
+        __sync_synchronize();
+
+        if (c->cfg.st_op == SELFTEST_WR) {
+            /* 只写：不比对，每轮换 pattern 直接覆盖 */
+            if (c->cfg.verbose)
+                printf("  [%s] 第 %" PRIu64 " 轮已写入 %" PRIu64 " 字节\n",
+                       c->cfg.owner[0] ? c->cfg.owner : b->bdf, i + 1, n);
+            continue;
+        }
+
+        /* 2) 回读比对：刚写的东西必须能原样读回 */
+        if (buf_compare(b->va + off, c->pat, n, &bad_off, &got, &exp) != 0) {
+            printf("  FAIL: 写入后回读不一致 @bar+0x%" PRIx64
+                   " got=0x%016" PRIx64 " exp=0x%016" PRIx64 "\n",
+                   off + bad_off, got, exp);
+            printf("  说明: 该地址写后读不回原值——设备未实现可写，或写被吞/被改写\n");
+            rc = -E_MISMATCH;
+            break;
+        }
+
+        /* 3) 写反码再回读：确认这一片确实可写（不是只回显旧值） */
+        copy_words(b->va + off, c->pat, n, 1);
+        __sync_synchronize();
+        if (buf_compare(b->va + off, c->pat, n, &bad_off, &got, &exp) == 0) {
+            printf("  FAIL: 写入反码后回读仍等于原 pattern @bar+0x%" PRIx64 "\n",
+                   off + bad_off);
+            printf("  说明: 该区间不可写或被硬连线，写入被静默丢弃\n");
+            rc = -E_MISMATCH;
+            break;
+        }
+    }
+
+    if (rc == E_OK)
+        printf("  PASS: %" PRIu64 " 轮读写回环全部一致（bar+0x%" PRIx64 "，%s）\n",
+               i < (uint64_t)loops ? i + 1 : (uint64_t)loops, off,
+               c->cfg.st_op == SELFTEST_WR ? "只写" : "写+回读");
+
+    free(c->pat);
+    c->pat = NULL;
+    printf("======================================================\n");
+    return rc;
 }
 
 /* 纯内存自检：验证 pattern 生成 -> 写入 -> 比对 这条 CPU 侧数据通路 */
@@ -2012,6 +2170,32 @@ static int cpu_one_iter(struct ctx *c, uint64_t iter, struct fail_info *fi)
              ^ (iter * 0x9E3779B97F4A7C15ull)
              ^ (off * 0xD1B54A32D192ED03ull);
 
+        if (c->cfg.no_init) {
+            /*
+             * --no_init：不填 init、不污染 test，只做 读 init -> 写 test 的搬运。
+             * 基准换成"读到的 init 实际内容"（bounce 本身），所以这里改比对
+             * test 是否等于 bounce，而不是等于预设 pattern。
+             */
+            copy_words(c->bounce, init, n, 0);
+            __sync_synchronize();
+            copy_words(test, c->bounce, n, 0);
+            __sync_synchronize();
+
+            if (buf_compare(test, c->bounce, n,
+                            &fi->bad_off, &fi->actual, &fi->expect) != 0) {
+                err_trip(c, E_MISMATCH);
+                fi->code = E_MISMATCH;
+                fi->bus = c->dst.phys + c->test_off + off + fi->bad_off;
+                fi->bar_off = c->test_off + off + fi->bad_off;
+                fi->len = n;
+                fi->seed = (uint32_t)seed;
+                return -E_MISMATCH;
+            }
+
+            off += n;
+            continue;
+        }
+
         /* 1) 初始化区：CPU 写已知 pattern */
         pattern_fill(c->pat, n, seed, c->cfg.pat_mode, iter);
         __sync_synchronize();
@@ -2280,69 +2464,99 @@ static int do_one_iter(struct ctx *c, uint64_t iter, struct fail_info *fi)
     c->init_cur_valid = 0;
 
     /* ---------- 阶段 1：CPU 把整片数据准备好 ---------- */
-    for (off = 0; off < c->cfg.size; ) {
-        uint64_t n = c->cfg.size - off;
-        uint64_t seed;
-
-        if (n > c->block)
-            n = c->block;
-
-        seed = iter_seed(c, iter, off);
-
-        /* 1) 初始化区：CPU 写入已知 pattern */
-        pattern_fill(c->pat, n, seed, c->cfg.pat_mode, iter);
-        __sync_synchronize();
-        copy_words(c->dst.va + c->init_off + off, c->pat, n, 0);
-
-        /* 2) 测试区：污染成 pattern 的反码（保证"没真正写进去"一定会被检出） */
-        copy_words(c->dst.va + c->test_off + off, c->pat, n, 1);
-        __sync_synchronize();
-
-        off += n;
-    }
-
     /*
-     * 阶段 1.5：回读 init 区，确认 CPU 写的数据真正落到 BAR 之后才起 DMA。
-     * emu 上 CPU 与 DMA 读写时间不一致，CPU 的 MMIO 写可能比 DMA 的读还慢——
-     * 实测 inc 模式下 DMA 读到的是上一轮的值，init/test 两个区都停在 iter-1。
-     * CPU 读自己的写要穿过 fabric（非 posted），回读一致即可证明"写已落"；
-     * 不一致就按 init_delay_ms（未配置则 1ms）等待重试，最多 1000 次。
-     * 注意回读只保证 CPU 视角落盘，DMA 路径的可见性仍可能滞后，所以
-     * init_delay_ms 的盲等仍有意义。
+     * --no_init：不填 init 区、也不污染 test 区。数据由外部预先写好
+     * （典型场景：对端卡的 DMA 刚写进来，或别的进程已经铺好），本轮只做
+     * "DMA 读 -> DMA 写 -> 对拍"。此时没有预设 pattern 可比，所以基准改成
+     * "CPU 在起 DMA 之前读到的 init 区实际内容"（存进 gold）。
+     *
+     * 注意 gold 必须在阶段 2 之前抓：DMA 写会把 test 区覆盖，但 init 区
+     * 本身不动，所以 stage1 抓一次即可，整轮有效。
      */
-    for (off = 0; off < c->cfg.size; ) {
-        uint64_t n = c->cfg.size - off;
-        uint64_t seed;
-        int      tries = 0;
+    if (c->cfg.no_init) {
+        for (off = 0; off < c->cfg.size; ) {
+            uint64_t n = c->cfg.size - off;
 
-        if (n > c->block)
-            n = c->block;
+            if (n > c->block)
+                n = c->block;
 
-        seed = iter_seed(c, iter, off);
-        pattern_fill(c->pat, n, seed, c->cfg.pat_mode, iter);
+            copy_words(c->gold + off, c->dst.va + c->init_off + off, n, 0);
+            off += n;
+        }
+        __sync_synchronize();
 
-        while (buf_compare(c->dst.va + c->init_off + off, c->pat, n,
-                           &fi->bad_off, &fi->actual, &fi->expect) != 0) {
-            if (++tries >= 1000 || g_stop) {
-                err_trip(c, E_INIT_CHECK);  /* 打点永远在最前 */
-                if (c->cfg.verbose)
-                    snap_regs(c);
-                fi->code = E_INIT_CHECK;
-                fi->bus = c->dst.phys + c->init_off + off + fi->bad_off;
-                fi->bar_off = c->init_off + off + fi->bad_off;
-                fi->len = n;
-                fi->seed = (uint32_t)seed;
-                return -E_INIT_CHECK;
-            }
-            delay_ms(c->cfg.init_delay_ms ? c->cfg.init_delay_ms : 1);
+        /*
+         * 抓完基准后仍等一次：让"刚落盘的 init 内容"对 DMA 路径也可见。
+         * CPU 能读到不代表 DMA 能读到（emu 上两条路径的可见性可以不同），
+         * 所以 --init_delay_ms 在这里依然是唯一的补偿手段。
+         */
+        if (c->cfg.init_delay_ms)
+            delay_ms(c->cfg.init_delay_ms);
+    } else {
+        for (off = 0; off < c->cfg.size; ) {
+            uint64_t n = c->cfg.size - off;
+            uint64_t seed;
+
+            if (n > c->block)
+                n = c->block;
+
+            seed = iter_seed(c, iter, off);
+
+            /* 1) 初始化区：CPU 写入已知 pattern */
+            pattern_fill(c->pat, n, seed, c->cfg.pat_mode, iter);
+            __sync_synchronize();
+            copy_words(c->dst.va + c->init_off + off, c->pat, n, 0);
+
+            /* 2) 测试区：污染成 pattern 的反码（保证"没真正写进去"一定会被检出） */
+            copy_words(c->dst.va + c->test_off + off, c->pat, n, 1);
+            __sync_synchronize();
+
+            off += n;
         }
 
-        off += n;
-    }
+        /*
+         * 阶段 1.5：回读 init 区，确认 CPU 写的数据真正落到 BAR 之后才起 DMA。
+         * emu 上 CPU 与 DMA 读写时间不一致，CPU 的 MMIO 写可能比 DMA 的读还慢——
+         * 实测 inc 模式下 DMA 读到的是上一轮的值，init/test 两个区都停在 iter-1。
+         * CPU 读自己的写要穿过 fabric（非 posted），回读一致即可证明"写已落"；
+         * 不一致就按 init_delay_ms（未配置则 1ms）等待重试，最多 1000 次。
+         * 注意回读只保证 CPU 视角落盘，DMA 路径的可见性仍可能滞后，所以
+         * init_delay_ms 的盲等仍有意义。
+         */
+        for (off = 0; off < c->cfg.size; ) {
+            uint64_t n = c->cfg.size - off;
+            uint64_t seed;
+            int      tries = 0;
 
-    /* 整片准备好后等一次，让 CPU 侧的写在 DMA 之前全部落地 */
-    if (c->cfg.init_delay_ms)
-        delay_ms(c->cfg.init_delay_ms);
+            if (n > c->block)
+                n = c->block;
+
+            seed = iter_seed(c, iter, off);
+            pattern_fill(c->pat, n, seed, c->cfg.pat_mode, iter);
+
+            while (buf_compare(c->dst.va + c->init_off + off, c->pat, n,
+                               &fi->bad_off, &fi->actual, &fi->expect) != 0) {
+                if (++tries >= 1000 || g_stop) {
+                    err_trip(c, E_INIT_CHECK);  /* 打点永远在最前 */
+                    if (c->cfg.verbose)
+                        snap_regs(c);
+                    fi->code = E_INIT_CHECK;
+                    fi->bus = c->dst.phys + c->init_off + off + fi->bad_off;
+                    fi->bar_off = c->init_off + off + fi->bad_off;
+                    fi->len = n;
+                    fi->seed = (uint32_t)seed;
+                    return -E_INIT_CHECK;
+                }
+                delay_ms(c->cfg.init_delay_ms ? c->cfg.init_delay_ms : 1);
+            }
+
+            off += n;
+        }
+
+        /* 整片准备好后等一次，让 CPU 侧的写在 DMA 之前全部落地 */
+        if (c->cfg.init_delay_ms)
+            delay_ms(c->cfg.init_delay_ms);
+    }
 
     /* ---------- 阶段 2：DMA 连续跑完整片 ---------- */
     for (off = 0; off < c->cfg.size; ) {
@@ -2393,16 +2607,28 @@ static int do_one_iter(struct ctx *c, uint64_t iter, struct fail_info *fi)
         delay_ms(c->cfg.check_delay_ms);
 
     for (off = 0; off < c->cfg.size; ) {
-        uint64_t n = c->cfg.size - off;
-        uint64_t seed;
+        uint64_t    n = c->cfg.size - off;
+        uint64_t    seed;
+        const uint8_t *exp;
 
         if (n > c->block)
             n = c->block;
 
         seed = iter_seed(c, iter, off);
-        pattern_fill(c->pat, n, seed, c->cfg.pat_mode, iter);
 
-        if (buf_compare(c->dst.va + c->test_off + off, c->pat, n,
+        /*
+         * 比对基准：
+         *   正常       = 本轮 pattern（CPU 亲手写的，DMA 原样搬回来才对）
+         *   --no_init = 阶段 1 抓的 init 区实测快照（gold）
+         */
+        if (c->cfg.no_init) {
+            exp = c->gold + off;
+        } else {
+            pattern_fill(c->pat, n, seed, c->cfg.pat_mode, iter);
+            exp = c->pat;
+        }
+
+        if (buf_compare(c->dst.va + c->test_off + off, exp, n,
                         &fi->bad_off, &fi->actual, &fi->expect) != 0) {
             err_trip(c, E_MISMATCH);    /* 校验一失败就写错误码，不做任何打印 */
             if (c->cfg.verbose)
@@ -2795,7 +3021,22 @@ static void usage(const char *prog)
         "                           off 是 bar 内绝对偏移（含 --dst_off）；\n"
         "                           auto = 从本地记录里取 bar 偏移，并自动与记录的期望/实际值对照\n"
         "      --peek_len <n>       --peek 的回读长度（默认 64 字节）\n"
-        "      --selftest           只跑 CPU 侧数据通路自检（不碰硬件），并打印 CPU 特性\n"
+        "      --selftest           只跑 CPU 侧数据通路自检，并打印 CPU 特性。\n"
+        "                           不带 -d 时是纯内存自检（不碰硬件）；\n"
+        "                           带 -d 时改为 CPU 直接读写该设备的 bar，位置由\n"
+        "                           --st_bar / --st_off / -l 指定，方向由 --st_op 指定。\n"
+        "      --st_op <rw|rd|wr>   --selftest 打 bar 时的方向（默认 rw）:\n"
+        "                           rw = 写 pattern -> 回读比对 -> 写反码确认确实可写\n"
+        "                           rd = 只读：dump 内容后退出，一个字节都不写\n"
+        "                           wr = 只写：按 pattern 反复覆盖，不回读比对\n"
+        "      --st_bar <n>         --selftest 用的 bar 号（默认跟随 --dst_bar）\n"
+        "      --st_off <off>       --selftest 区间的 bar 内起始偏移（默认 0，须 8 字节对齐）\n"
+        "      --no_init            闭环测试跳过\"CPU 填 init 区 + 污染 test 区\"这一步。\n"
+        "                           init 区内容由外部预置（典型：对端卡的 DMA 刚写进来，\n"
+        "                           或另一个进程已经铺好），本轮只做 DMA 读 -> DMA 写。\n"
+        "                           此时没有预设 pattern，比对基准改成\"起 DMA 之前 CPU\n"
+        "                           读到的 init 区实际内容\"，仍能验证搬运是否无损。\n"
+        "                           与 --stress 互斥（压力模式本来就不改写数据）。\n"
         "  -h, --help               显示本帮助\n"
         "\n"
         "说明:\n"
@@ -2827,7 +3068,11 @@ static void usage(const char *prog)
         "     每个源头自己节点里的 N_ERRFLAG 只标记自己，--list 可直接看。\n"
         "  6) 头里的字段全部 4 字节对齐、只做 32 位整字访问（64 位字段拆成两个字、\n"
         "     字符串按 4 字节打包），不产生 8/16/8 位或非对齐的头访问。\n"
-        "  7) 需要 root 或对应 resource 节点读写权限。\n",
+        "  7) 需要 root 或对应 resource 节点读写权限。\n"
+        "  8) --no_init 与 --selftest 的分工：前者让闭环测试不写 init 区（数据由外部预置），\n"
+        "     后者让 CPU 单独直接读写某个 bar 的某一段、不涉及 DMA。\n"
+        "     想先确认\"DMA 会读的那片 init 区里到底是什么\"，先用 --selftest --st_op rd 看一眼，\n"
+        "     再用 --no_init 跑闭环；两者用同一组 --st_bar/--st_off/-l 对齐坐标。\n",
         prog, prog, prog);
 }
 
@@ -2861,6 +3106,9 @@ int main(int argc, char **argv)
     c.cfg.addr_step = 0;           /* 0 = 自动（4 KiB 页滑 / 小区按 qword 滑） */
     c.cfg.stop_on_err = 1;
     c.cfg.check_status = 1;
+    c.cfg.st_op = SELFTEST_RW;
+    c.cfg.st_bar = -1;             /* -1 = 跟随 --dst_bar */
+    c.cfg.st_off = 0;
 
     static const struct option long_opts[] = {
         { "src_bdf",        required_argument, NULL, 's' },
@@ -2906,6 +3154,14 @@ int main(int argc, char **argv)
         { "peek-len",       required_argument, NULL, 'g' },
         { "selftest",       no_argument,       NULL, 'X' },
         { "self-test",      no_argument,       NULL, 'X' },
+        { "no_init",        no_argument,       NULL, 'q' },
+        { "no-init",        no_argument,       NULL, 'q' },
+        { "st_op",          required_argument, NULL, 'y' },
+        { "st-op",          required_argument, NULL, 'y' },
+        { "st_bar",         required_argument, NULL, 'b' },
+        { "st-bar",         required_argument, NULL, 'b' },
+        { "st_off",         required_argument, NULL, 'f' },
+        { "st-off",         required_argument, NULL, 'f' },
         { "clear",          no_argument,       NULL, 'c' },
         { "clear_only",     no_argument,       NULL, 'L' },
         { "clear-only",     no_argument,       NULL, 'L' },
@@ -3044,6 +3300,32 @@ int main(int argc, char **argv)
             }
             break;
         case 'X': c.cfg.selftest = 1; break;
+        case 'q': c.cfg.no_init = 1; break;
+        case 'y':
+            if (strcmp(optarg, "rw") == 0 || strcmp(optarg, "both") == 0)
+                c.cfg.st_op = SELFTEST_RW;
+            else if (strcmp(optarg, "rd") == 0 || strcmp(optarg, "read") == 0)
+                c.cfg.st_op = SELFTEST_RD;
+            else if (strcmp(optarg, "wr") == 0 || strcmp(optarg, "write") == 0)
+                c.cfg.st_op = SELFTEST_WR;
+            else {
+                fprintf(stderr, "--st_op 参数非法: %s（rw / rd / wr）\n", optarg);
+                return E_USAGE;
+            }
+            break;
+        case 'b':
+            c.cfg.st_bar = atoi(optarg);
+            if (c.cfg.st_bar < 0) {
+                fprintf(stderr, "--st_bar 参数非法: %s\n", optarg);
+                return E_USAGE;
+            }
+            break;
+        case 'f':
+            if (parse_size(optarg, &c.cfg.st_off) != 0) {
+                fprintf(stderr, "--st_off 参数非法: %s\n", optarg);
+                return E_USAGE;
+            }
+            break;
         case 'c': c.cfg.clear = 1; break;
         case 'L': c.cfg.clear_only = 1; break;
         case 'N': c.cfg.list = 1; break;
@@ -3099,9 +3381,28 @@ int main(int argc, char **argv)
         return E_OK;
     }
 
-    /* 纯内存自检：不碰硬件，用来区分"环境问题"和"程序问题" */
-    if (c.cfg.selftest)
-        return run_selftest(&c);
+    /*
+     * 自检：带 -d 就打真 bar（--st_bar/--st_off/-l 指定位置），
+     * 不带 -d 走老行为（纯内存，不碰硬件）。
+     */
+    if (c.cfg.selftest) {
+        if (!c.cfg.dst_bdf[0])
+            return run_selftest(&c);
+
+        normalize_bdf(c.cfg.dst_bdf, dst_bdf, sizeof(dst_bdf));
+        if (c.cfg.st_bar >= 0)
+            c.cfg.dst_bar = c.cfg.st_bar;
+
+        /* 只读模式不开写权限：映射只读，硬件侧就不可能被改动 */
+        rc = open_bar(&c.dst, dst_bdf, c.cfg.dst_bar,
+                      c.cfg.st_op != SELFTEST_RD, 0);
+        if (rc != E_OK)
+            return -rc;
+
+        rc = run_selftest_bar(&c);
+        close_bar(&c.dst);
+        return rc == E_OK ? 0 : 1;
+    }
 
     /* 只读回本地 DDR 里的错误记录（失败后单独使用，不需要碰 bar） */
     if (c.cfg.dump_err) {
@@ -3224,6 +3525,13 @@ int main(int argc, char **argv)
         return E_USAGE;
     }
 
+    /* --no_init 与纯压力互斥：压力模式本来就不填 init 区，语义重复容易误解 */
+    if (c.cfg.no_init && c.cfg.stress) {
+        fprintf(stderr, "--no_init 不能与 --stress 同时使用"
+                        "（压力模式本来就不改写数据）\n");
+        return E_USAGE;
+    }
+
     if (c.cfg.cpu_mode) {
         /* CPU 模式不需要 DMA 控制器：把 src 描述成一个虚拟源头，
          * 这样日志、占用链里的"源头"字段仍然有内容，也不用到处判空 */
@@ -3329,6 +3637,22 @@ int main(int argc, char **argv)
         return E_NOMEM;
     }
 
+    /*
+     * --no_init 需要一个整片大小的快照缓冲当比对基准（跨分块，不能按 block 分）。
+     * --cpu 模式不用 gold：它的基准就是 bounce（读回来的中间副本），
+     * 分配了也用不上，省一片内存。
+     */
+    if (c.cfg.no_init && !c.cfg.cpu_mode) {
+        c.gold = malloc((size_t)c.cfg.size);
+        if (!c.gold) {
+            fprintf(stderr, "分配 %" PRIu64 " 字节 init 快照缓冲失败\n", c.cfg.size);
+            free(c.pat);
+            close_bar(&c.dst);
+            close_bar(&c.src);
+            return E_NOMEM;
+        }
+    }
+
     /* CPU 模式需要一个"中间内存"顶替 ACS 内部内存，完成 读->中间->写 的闭环 */
     if (c.cfg.cpu_mode) {
         c.bounce = malloc((size_t)c.block);
@@ -3384,6 +3708,11 @@ int main(int argc, char **argv)
         printf("  错误详情     : 本地 DDR  %s\n", c.el_path);
         printf("  单区大小     : %s   初始化区@bar+0x%" PRIx64
                "  测试区@bar+0x%" PRIx64 "\n", sz, c.init_off, c.test_off);
+        if (c.cfg.no_init)
+            printf("  初始化       : 已跳过（--no_init，init 区内容由外部预置，"
+                   "以其实测值作比对基准）\n");
+        else
+            printf("  初始化       : CPU 填 pattern + 污染 test 区 + 回读确认落盘\n");
         printf("  单次传输     : %s%s\n", blk,
                c.cfg.chunk ? " (分块)" : " (整区一次传输)");
         printf("  循环次数     : %" PRIu64 "%s\n", c.cfg.times,
@@ -3398,7 +3727,8 @@ int main(int argc, char **argv)
                c.cfg.stress == STRESS_RD ? "纯压力 只读（不校验，数据只初始化一次）" :
                c.cfg.stress == STRESS_WR ? "纯压力 只写（不校验，数据只初始化一次）" :
                c.cfg.stress == STRESS_BOTH ? "纯压力 读+写（不校验，数据只初始化一次）" :
-                                             "读-改-写闭环（逐轮 pattern + CPU 回读校验）");
+               c.cfg.no_init ? "读-改-写闭环（--no_init：跳过 CPU 初始化，以 init 实测值对拍）" :
+                               "读-改-写闭环（逐轮 pattern + CPU 回读校验）");
         printf("  数据模式     : %s%s\n",
                c.cfg.pat_mode == PAT_INC ? "递增 inc（每轮 +1，qword 逐个递增）" :
                c.cfg.pat_mode == PAT_ALT ? "翻转 alt（5A5A/A5A5 逐轮交替）" :
@@ -3425,7 +3755,10 @@ int main(int argc, char **argv)
         } else {
             printf("  初始化延迟   : %u ms%s\n", c.cfg.init_delay_ms,
                    c.cfg.init_delay_ms ? "" : " (未启用，CPU 写完立即起 DMA)");
-            printf("  初始化回读   : 开启（CPU 写后回读校验，不符按初始化延迟重试至多 1000 次）\n");
+            if (c.cfg.no_init)
+                printf("  初始化回读   : 已跳过（--no_init：只抓 init 实测值作基准，不回读重试）\n");
+            else
+                printf("  初始化回读   : 开启（CPU 写后回读校验，不符按初始化延迟重试至多 1000 次）\n");
             printf("  回读延迟     : %u ms%s\n", c.cfg.check_delay_ms,
                    c.cfg.check_delay_ms ? "" : " (未启用，DMA 完成后立即回读)");
         }
@@ -3452,6 +3785,7 @@ int main(int argc, char **argv)
         dump_regs(&c, "after");
 
     free(c.bounce);
+    free(c.gold);
     free(c.pat);
     err_local_close(&c);
     close_bar(&c.dst);

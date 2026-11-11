@@ -43,6 +43,8 @@ bdfdst BAR 的 test 区（CPU 回读，与 pattern 逐字节比对）
 9. **emu 时序补偿**：`--init_delay_ms`（CPU 写完 → DMA 读之前）、`--check_delay_ms`（DMA 报完成 → CPU 回读之前）。另有初始化区**回读校验**（不符则重试，仍不符报 `E_INIT_CHECK=13`），用于区分"写丢了"和"写还没落盘"。
 10. **事后取证**：`--dump_err` 读本地记录；`--peek auto` 重新 mmap 出错地址并与记录的期望/实际值对照；`--pause_on_err` 失败后 `SIGSTOP` 冻结进程保现场。
 11. **数据模式** `--pat rand|inc|alt`：rand=splitmix64 随机流；inc=每轮整体 +1；alt=0x5A../0xA5.. 逐轮翻转（后两者不依赖随机种子，便于对着波形算期望值）。
+12. **`--no_init` 跳过 CPU 初始化**：不填 init 区、不污染 test 区，只跑 DMA 读→DMA 写。用于"数据已由对端（另一张卡 / 别的进程）写好，本轮只验搬运"的场景。比对基准改为**起 DMA 前 CPU 读到的 init 实测内容**（整片 `gold` 缓冲），所以仍能判搬运是否无损；`--cpu` 模式下基准就是 `bounce`。与 `--stress` 互斥。
+13. **`--selftest` 可选打真 bar**：不带 `-d` 时是老的纯内存自检；带 `-d` 时由 CPU 直接读写指定 bar 的指定段（`--st_bar` / `--st_off` / `-l`），方向由 `--st_op rw|rd|wr` 决定。`rd` 模式连 mmap 都是只读的，硬件侧不可能被改动。用来在跑闭环前先确认"那片 init 区里到底是什么"。
 
 ## 4. 错误码
 
@@ -89,6 +91,13 @@ sudo ./dma_acs_test -d 02:00.0 -L
 sudo ./dma_acs_test -d 02:00.0 -c
 sudo ./dma_acs_test -d 02:00.0 --owner dma0 --dump_err     # 读本地记录文件
 sudo ./dma_acs_test -d 02:00.0 --owner dma0 --peek auto    # 回读 bar 对照
+
+# 跳过 CPU 初始化：数据由外部预置，只验"DMA 读 -> DMA 写"这段搬运
+sudo ./dma_acs_test -s 01:00.0 -d 02:00.0 -l 1M -n 0 --no_init --check_delay_ms 5
+
+# CPU 直接读写某个 bar 的某一段（不经过 DMA），先看清那片空间里是什么
+sudo ./dma_acs_test -d 02:00.0 --selftest --st_bar 0 --st_off 0x1000 -l 4K --st_op rd
+sudo ./dma_acs_test -d 02:00.0 --selftest --st_bar 0 --st_off 0x1000 -l 4K --st_op rw
 ```
 
 ## 6. 当前状态与待确认项
@@ -105,6 +114,10 @@ sudo ./dma_acs_test -d 02:00.0 --owner dma0 --peek auto    # 回读 bar 对照
 - [ ] 失败时序打点是否满足 trigger 抓波形需求（头里 err_flag 一条 32 位写；用 `--list` 打印的地址设 trigger）
 - [ ] emu 上头的读写是否确实只出现 4 字节对齐的 32 位事务（无 8 字节、无字节/半字）
 - [ ] `--clear` 只清到链尾（不扫整条 bar），清空后 `--list` 应为空链、`free_off` 回到 `off+0x100`
+- [ ] `--no_init`：`gold` 基准是否与 DMA 实际读到的内容一致（若 emu 上 P2P 落盘延迟大，
+      需调 `--init_delay_ms`；预期 mismatch 是"CPU 读到了、DMA 还没读到"）
+- [ ] `--selftest --st_op rd|rw|wr`：指定 bar/off/size 的读写是否符合预期；
+      `rd` 应一个字节都不写（映射只读）；`rw` 的"写反码必须读不回原值"这条能否判出硬连线区间
 
 ## 7. 约定
 
